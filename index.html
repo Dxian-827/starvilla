@@ -904,10 +904,10 @@ const tiled=(mat,size)=>{ mat.userData.tile=size; return mat; };
 const loader=new THREE.TextureLoader();
 const lazyTex=[];   /* 只有屋里用的贴图（布纹、地毯）：小区首屏不下载，第一次进屋才下（loadLazyTex） */
 /* 手机直接下 512 版（tex/m/，10-24：手机打开慢。以前下 1K/2K 原图、下完再缩到 512，七套图约 1.9 MB，512 版约 0.3 MB，缩完一样） */
-const MOB_TEX = matchMedia('(pointer:coarse)').matches ? new Set(['floor_marble','granite_tile','marble_01','walnut_veneer_02','white_plaster_02','wood_floor','herringbone_concrete_tile_03']) : null;
+const MOB_TEX = null;   /* 11-21 起手机也下 1K 原图（用户：手机看不清，可以多等；约多 1.6 MB）。要换回 512 版：写回 matchMedia('(pointer:coarse)').matches ? new Set(['floor_marble','granite_tile','marble_01','walnut_veneer_02','white_plaster_02','wood_floor','herringbone_concrete_tile_03']) : null */
 const real=(name,{diff=true,nor=true,rough=true,lazy=false}={})=>{
   const ld=(f,srgb)=>{ const url=`tex/${MOB_TEX?.has(name)?'m/':''}${name}_${f}.webp`;
-    const t = lazy ? new THREE.Texture() : loader.load(url, shrinkTex);   /* 手机上下载完缩到 512（55_perf.js） */
+    const t = lazy ? new THREE.Texture() : loader.load(url, shrinkTex, undefined, ()=>{ if(url.includes('/m/')) loader.load(url.replace('/m/','/'), im=>{ t.image=im.image; t.needsUpdate=true; shrinkTex(t); markDirty(); }); });   /* 手机上下载完缩到 512（55_perf.js）；手机版 512 小图下不到（11-21：线上漏传 tex/m/，地面、胡桃木全黑）就改下原图 */
     if(lazy){ t.userData.url=url; lazyTex.push(t); }
     t.wrapS=t.wrapT=THREE.RepeatWrapping; t.anisotropy=8; if(srgb) t.colorSpace=THREE.SRGBColorSpace; return t; };
   return { map: diff?ld('diff',true):null, normalMap: nor?ld('nor',false):null, roughnessMap: rough?ld('rough',false):null };
@@ -7112,13 +7112,13 @@ function cullTiles(walk,eye){
   for(const t of siteTiles) t.visible = !walk || t.userData.center.distanceTo(eye)-t.userData.radius < WALK_R.tile;
 }
 
-/* 手机上大贴图运行时缩到 512：不多下载，显存约省四分之三（1024² 带多级纹理约 5.6 MB，512² 约 1.4 MB） */
-const SMALL_TEX = COARSE ? 512 : 0;
+/* 手机上大贴图运行时缩小：不多下载，省显存（1024² 带多级纹理约 5.6 MB，2048² 约 22 MB） */
+const SMALL_TEX = COARSE ? 1024 : 0, SMALL_MAP = SMALL_TEX;   /* 11-21 用户：手机看着糊、可以多等。以前缩到 512，现在只把大于 1K 的缩到 1K（客餐厅地砖原图 2K）；显存多一些 */
 const shrunk=new WeakSet();
-function shrinkTex(t){
-  if(!SMALL_TEX || !t || shrunk.has(t)) return; shrunk.add(t);
-  const go=()=>{ const im=t.image; if(!im || !(im.width>SMALL_TEX)) return;
-    const k=SMALL_TEX/Math.max(im.width,im.height), cv=document.createElement('canvas');
+function shrinkTex(t,lim=SMALL_TEX){
+  if(!lim || !t || shrunk.has(t)) return; shrunk.add(t);
+  const go=()=>{ const im=t.image; if(!im || !(im.width>lim)) return;
+    const k=lim/Math.max(im.width,im.height), cv=document.createElement('canvas');
     cv.width=Math.max(1,Math.round(im.width*k)); cv.height=Math.max(1,Math.round(im.height*k));
     cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
     if(im.close) im.close();   /* ImageBitmap 用完就释放 */
@@ -7126,23 +7126,25 @@ function shrinkTex(t){
   let n=0; const wait=()=>{ if(t.image && t.image.width) go(); else if(++n<150) setTimeout(wait,200); };   /* 贴图还在下载就等一等（最多 30 秒） */
   wait();
 }
-function shrinkMaterial(m){ if(!SMALL_TEX) return; for(const k of ['map','normalMap','roughnessMap','metalnessMap','aoMap','bumpMap','emissiveMap']) if(m[k]) shrinkTex(m[k]); }
+function shrinkMaterial(m){ if(!SMALL_TEX) return; for(const k of ['map','normalMap','roughnessMap','metalnessMap','aoMap','bumpMap','emissiveMap']) if(m[k]) shrinkTex(m[k], k==='map' ? SMALL_MAP : SMALL_TEX); }
 
-/* 画质分档：高 = AO + SMAA + 大阴影；中 = 半分辨率 AO + 2048 阴影；低 = 不开 AO、像素比 1、1024 阴影。三档都走同一条合成器，换档不用重编着色器。
-   先按设备猜一档，之后按连续出画时的实测帧时间往下调（只降不升，免得来回跳） */
+/* 画质分档（11-21 晚用户定：「保持比较高清的状态」，动的时候也不降清晰度）：各档动和停都按屏幕像素比画（电脑最多 2 倍、手机最多 3 倍），停下那一张再超采样（ss）；
+   档位之间只差效果（AO、阴影大小、倒影），不差清晰度。都走同一条合成器，换档不用重编着色器。先按设备猜一档，实在卡（个位数帧）才往下降一档（只降不升） */
 const QUAL={ high:{pr:2, ao:'Medium', half:true, smaa:true, shadow:4096, refl:true, mirror:true},   /* refl：抛光地砖倒影（57_light.js reflDraw，多画一遍屋子，只有高档开）；mirror：卫生间镜子倒影（mirDraw，只在镜子跟前画） */
-             mid:{pr:1.5, ao:'Low', half:true, smaa:true, shadow:2048, mirror:true},   /* AO 两档都用半分辨率（看不出差别，快一半）：以前高档全分辨率，自动降到中档时一换分辨率 AO 要重编 20 个着色器，卡 2 秒 */
-             phone:{pr:1.25, still:2, ao:null, half:true, smaa:true, shadow:1024},   /* 手机起步档（10-24 用户：手机打开、转动、进楼、走路都卡）：不开 AO（AO 每帧要把整个场景多画一遍深度法线），阴影 1024，动的时候像素比 1.25（再乘 MOTION） */
-             low:{pr:1, still:2, ao:null, half:true, smaa:true, shadow:1024} };   /* 低档也走合成器（画到渲染目标里，硬件抗锯齿不起作用），SMAA 留着。
-             still：停下来那一张按屏幕像素比画（最多 2 倍）——只画一张，慢点没关系；10-28 晚用户嫌集显电脑上小区太糊（以前停下也是 1 倍，1.25 倍屏上发虚） */
+             mid:{pr:2, ao:'Low', half:true, smaa:true, shadow:2048, mirror:true},   /* AO 两档都用半分辨率（看不出差别，快一半）。11-21 起像素比和高档一样（以前 1.5，降到中档就变糊） */
+             igpu:{pr:2, still:2, ss:2, ao:null, half:true, smaa:true, fastAA:true, shadow:2048},   /* 集显电脑起步档（11-21）：动、停都按屏幕像素比（最多 2 倍），停下那一张 2 倍超采样再缩到屏幕。
+               不开 AO：AO 只加暗部、不让画面变清楚，还要每帧多画一遍深度（10-28 起集显就不下 AO 库） */
+             phone:{pr:3, still:3, ss:1.5, ao:null, half:true, smaa:true, fastAA:true, shadow:2048},   /* 手机起步档：动、停都按屏幕像素比（最多 3 倍），2 倍屏的手机停下那一张超采样 1.5 倍。
+               10-24 用户嫌卡改成 1.25 倍、10-28 动的时候再乘 0.55–0.75；11-21 用户嫌糊（「可以多等，画质要高」「保持高清」）全部取消。不开 AO */
+             low:{pr:COARSE?3:2, still:COARSE?3:2, ss:COARSE?1.5:2, ao:null, half:true, smaa:true, fastAA:true, shadow:1024} };   /* 保底档（个位数帧才降到这里）：清晰度不降，只关 AO、阴影改 1024、不画倒影
+             still：网页画布的像素比上限；ss：停下那一张再超采样几倍（总像素比 ≤3、总像素 ≤830 万，60_nav.js stillPR），超采样那张用另一套合成器、不过 SMAA；fastAA：动的时候不过 SMAA（60_nav.js motionScale）——11-21 晚用户「要顺一点，可以少点阴影」，实测阴影几乎不费时间（只在有变化时重算），俯瞰一帧约 30 ms 里 SMAA 6、地面 7、树 7 */
 const GPU=(()=>{ try{ const gl=renderer.getContext(), e=gl.getExtension('WEBGL_debug_renderer_info'); return e ? String(gl.getParameter(e.UNMASKED_RENDERER_WEBGL)) : ''; }catch(_){ return ''; } })();
-const WEAK_GPU = !COARSE && /Intel|UHD|Iris|HD Graphics|SwiftShader|llvmpipe|Basic Render/i.test(GPU);   /* 10-28 用户电脑（Intel UHD 集显）：高档 15–20 帧、低档 35 帧左右，以前从高档起步、要卡十来秒才自动降下来 */
-let qual = COARSE ? 'phone' : WEAK_GPU ? 'low' : 'high';
-const QUAL_NEXT={high:'mid', mid:'low', phone:'low'}, QUAL_SLOW = COARSE ? 30 : 40;   /* 平均每帧超过这么多毫秒就降一档：手机 30 ms（不到 33 帧就降） */
-/* 动的时候降分辨率（10-28 用户：电脑、手机进别墅走路、进楼揭顶还是卡）：Intel 集显上整帧卡在像素着色（分辨率减半快 3 倍，面数减了不怎么快），
-   镜头在动时后期合成器按 档位 pr × MOTION 倍画、拉伸到屏幕，停下 0.25 秒按网页画布的像素比（档位 still）补一张清晰的。只动合成器里面的渲染目标，网页画布不动，切换不卡。
-   开 AO 的档（高、中）不用：AO 换尺寸要重建。倍数按动的时候实测帧时间在 [lo,hi] 里调，目标每帧 TGT 毫秒 */
-const MOTION={ phone:{s:0.75, lo:0.55, hi:1}, low:{s:0.7, lo:0.5, hi:1}, TGT:28, still:250 };
+const WEAK_GPU = !COARSE && /Intel|UHD|Iris|HD Graphics|SwiftShader|llvmpipe|Basic Render/i.test(GPU);   /* 10-28 用户电脑（Intel UHD 集显）：高档 15–20 帧，以前从高档起步、要卡十来秒才自动降下来；11-21 起从 igpu 档起步 */
+let qual = COARSE ? 'phone' : WEAK_GPU ? 'igpu' : 'high';
+const QUAL_NEXT={high:'mid', mid:'low', igpu:'low', phone:'low'}, QUAL_SLOW = 110;   /* 平均每帧超过 110 ms（不到 9 帧）才降一档（11-21 晚用户：不要为了流畅降清晰度；降档也只降效果） */
+/* 动的时候降分辨率（10-28 加，11-21 晚取消）：MOTION 各档倍数都是 1，动的时候按画布像素比画（不再降），停下 0.25 秒按 still、ss 补一张超采样的。
+   留着这套是为了以后要再降时改个数就行。11-21 本机（Intel UHD，1536×730、125%）转镜头实测帧率：0.7 倍 48 帧、0.85 倍 37、原分辨率 28–30（现在用的） */
+const MOTION={ igpu:{s:1, lo:1, hi:1}, phone:{s:1, lo:1, hi:1}, low:{s:1, lo:1, hi:1}, TGT:28, still:250 };
 const frameTimes=[];
 let qualHoldUntil=0;
 function qualHold(ms=2500){ qualHoldUntil=performance.now()+ms; frameTimes.length=0; }   /* 刚搭好套件、切傍晚时要编着色器，那几秒的卡顿不算 */
@@ -7150,7 +7152,7 @@ function qualTick(ms){   /* 每画一帧调一次，ms 是这帧离上一帧的�
   if(performance.now()<qualHoldUntil) return; ms=Math.min(ms,1000);
   frameTimes.push(ms); if(frameTimes.length<45) return;   /* 10-28：90 帧→45 帧，慢的机器少卡几秒 */
   const avg=frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length; frameTimes.length=0;
-  if(avg>QUAL_SLOW && QUAL_NEXT[qual]){ setQual(avg>QUAL_SLOW*1.6 ? 'low' : QUAL_NEXT[qual]);   /* 慢很多就直接降到低档 */ console.info('画质自动降到', qual, `（平均每帧 ${avg.toFixed(1)} ms）`); }
+  if(avg>QUAL_SLOW && QUAL_NEXT[qual]){ setQual(QUAL_NEXT[qual]); console.info('画质自动降到', qual, `（平均每帧 ${avg.toFixed(1)} ms）`); }
 }
 /* ============ 光影：室内烘焙光照、灯光光晕 ============ */
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -8966,7 +8968,7 @@ function resize(){
   const w=canvas.clientWidth, h=canvas.clientHeight; lastW=w; lastH=h;
   if(!w || !h) return;   /* 页面在后台、画布还没尺寸：宽高比会算成 NaN，镜头位置跟着变 NaN，之后整页一直空白 */
   renderer.setSize(w,h,false); labelR.setSize(w,h); cvRect=canvas.getBoundingClientRect(); lblDirty=true; lblT=0;
-  if(fine){ drawPR=renderer.getPixelRatio(); fine.composer.setPixelRatio(drawPR); fine.composer.setSize(w,h); }   /* 先按停着的画；在动的话下一帧 motionScale 再降 */
+  if(fine){ drawPR=renderer.getPixelRatio(); fine.useSS=false; fine.composer.setPixelRatio(drawPR); fine.composer.setSize(w,h); }   /* 先按画布的画；下一帧 motionScale 再换成动的时候的、或停下超采样的 */
   camera.aspect=w/h; camera.updateProjectionMatrix(); fitOrbitLimits(); markDirty();
   miniFg=getComputedStyle(document.documentElement).getPropertyValue('--fg').trim()||'#222'; drawMini();
 }
@@ -8991,7 +8993,7 @@ function setQual(q){
   qual=q; const Q=QUAL[q];
   renderer.setPixelRatio(Math.min(devicePixelRatio,Q.still||Q.pr));   /* 有 still 的档：画布按停着的清晰度，动的时候合成器自己降（motionScale） */
   if(sun.shadow.mapSize.x!==Q.shadow){ sun.shadow.mapSize.setScalar(Q.shadow); if(sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map=null; } }
-  if(fine){ const ao=fine.ao && Q.ao; if(ao){ fine.ao.setQualityMode(Q.ao); fine.ao.configuration.halfRes=Q.half; } if(fine.ao) fine.ao.enabled=!!ao; fine.rp.enabled=!ao; fine.smaa.enabled=Q.smaa; }
+  if(fine){ const ao=fine.ao && Q.ao; if(ao){ fine.ao.setQualityMode(Q.ao); fine.ao.configuration.halfRes=Q.half; } if(fine.ao) fine.ao.enabled=!!ao; fine.rp.enabled=!ao; fine.smaa.enabled=Q.smaa; if(!Q.ss && fine.ss){ fine.ss.dispose(); fine.ss=null; } }   /* 降到没有超采样的档：停下那套合成器的显存放掉 */
   resize(); markDirty();
 }
 addEventListener('resize',fitSheet);
@@ -9178,18 +9180,33 @@ const lastCam=new THREE.Matrix4(), lastProj=new THREE.Matrix4();
 /* 动的时候降分辨率（55_perf.js MOTION）：镜头在动就按 档位 pr × 倍数 画，停下 MOTION.still 毫秒换回画布的像素比补画一张清晰的 */
 const motS={}; for(const k in MOTION) if(MOTION[k].s) motS[k]=MOTION[k].s;
 const motT=[];
+/* 停下那一张的像素比（11-21）：档位有 ss 的按画布像素比 × ss 超采样（总像素比 ≤3、总像素 ≤830 万），合成器画大、最后一步缩到画布，边缘、树叶、屋顶纹理都细一些；只画一张，慢一点没关系 */
+function stillPR(){
+  const c=renderer.getPixelRatio(), Q=QUAL[qual];
+  if(!Q.ss || !fine || fine.ao?.enabled || rec || !lastW) return c;
+  return Math.max(c, Math.min(c*Q.ss, 3, Math.sqrt(8.3e6/(lastW*lastH))));
+}
+/* 停下那一张用另一套合成器（fine.ss，只有 RenderPass + OutputPass，不过 SMAA：超采样本身就不起锯齿，集显上 SMAA 一遍十来毫秒）：
+   两套各自留着尺寸，停下、再动都不用重新分配渲染目标（11-21 实测：共用一套时，从 2.5 倍换回来那一帧卡 0.15 秒）。显存多一套（集显 1536×730 约 140 MB） */
+function ssMake(){ const c=new EffectComposer(renderer); c.addPass(new RenderPass(scene,camera)); c.addPass(new OutputPass()); return c; }
 function motionScale(now){
-  const on=motS[qual] && fine && !fine.ao?.enabled && !rec && now-lastMove<MOTION.still;   /* 录屏时不降 */
-  const pr=on ? Math.min(renderer.getPixelRatio(), Math.min(devicePixelRatio,QUAL[qual].pr)*motS[qual]) : renderer.getPixelRatio();
-  if(pr===drawPR || !fine || !lastW) return;
-  drawPR=pr; motT.length=0; fine.composer.setPixelRatio(pr); fine.composer.setSize(lastW,lastH); dirty=Math.max(dirty,1);
+  if(!fine || !lastW) return;
+  const on=motS[qual] && !fine.ao?.enabled && !rec && now-lastMove<MOTION.still;   /* 录屏时不降 */
+  const pr=on ? Math.min(renderer.getPixelRatio(), Math.min(devicePixelRatio,QUAL[qual].pr)*motS[qual]) : stillPR();
+  const useS=!on && pr>renderer.getPixelRatio()*1.01;   /* 停下那张真比画布大（超采样）才用另一套；3 倍屏手机停下也是 3 倍，就用原来那套 */
+  const aa=QUAL[qual].smaa && !(QUAL[qual].fastAA && now-lastMove<MOTION.still);   /* 11-21 晚：动的时候不过 SMAA（集显上一遍 5–6 ms，占一帧五分之一），只多一点边缘锯齿、不变糊；停下那张照旧抗锯齿 */
+  if(pr===drawPR && useS===!!fine.useSS && aa===fine.smaa.enabled) return;
+  drawPR=pr; motT.length=0; fine.useSS=useS; fine.smaa.enabled=aa; dirty=Math.max(dirty,1);
+  const C=useS ? (fine.ss ??= ssMake()) : fine.composer;
+  C.setPixelRatio(pr); C.setSize(lastW,lastH);   /* 尺寸没变时不重新分配 */
 }
 function motionTick(ms){   /* 降着画的时候量帧时间：慢了再降一点，快了往回加（每 20 帧调一次，一次 0.05） */
-  const M=MOTION[qual]; if(!M || drawPR>=renderer.getPixelRatio() || performance.now()<qualHoldUntil) return;
+  const M=MOTION[qual], t=performance.now(); if(!M || t-lastMove>=MOTION.still || t<qualHoldUntil) return;   /* 11-21：以前按 drawPR 小于画布判断在动，集显档动的时候就是原分辨率，判断不出来 */
   motT.push(Math.min(ms,200)); if(motT.length<20) return;
   const avg=motT.reduce((a,b)=>a+b,0)/motT.length; motT.length=0;
-  if(avg>MOTION.TGT*1.15) motS[qual]=Math.max(M.lo,+(motS[qual]-0.05).toFixed(2));
-  else if(avg<MOTION.TGT*0.7) motS[qual]=Math.min(M.hi,+(motS[qual]+0.05).toFixed(2));
+  const T=M.tgt||MOTION.TGT;
+  if(avg>T*1.15) motS[qual]=Math.max(M.lo,+(motS[qual]-0.05).toFixed(2));
+  else if(avg<T*0.7) motS[qual]=Math.min(M.hi,+(motS[qual]+0.05).toFixed(2));
 }
 renderer.setAnimationLoop(now=>{
   if(!gateOpen){ last=now; return; }   /* 第一帧之前（加载画面盖着）：着色器在后台编，先不画 */
@@ -9214,7 +9231,7 @@ renderer.setAnimationLoop(now=>{
   motionScale(now);
   if(!drawHold && (dirty>0 || !lastCam.equals(camera.matrixWorld) || !lastProj.equals(camera.projectionMatrix))){
     reflDraw(); mirDraw();
-    if(fine){ if(fine.ao) fine.ao.configuration.aoRadius = state.mode==='walk' ? 0.7 : 1.2; fine.composer.render(); }
+    if(fine){ if(fine.ao) fine.ao.configuration.aoRadius = state.mode==='walk' ? 0.7 : 1.2; (fine.useSS && fine.ss ? fine.ss : fine.composer).render(); }
     else renderer.render(scene,camera);   /* 后期库没加载上：直接画 */
     labelR.render(scene,camera);
     if(!lastCam.equals(camera.matrixWorld) || !lastProj.equals(camera.projectionMatrix)){ lblDirty=true; lastInput=now; }   /* 镜头还在动（惯性、自动走路）也算在动 */
